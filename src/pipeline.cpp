@@ -1,0 +1,332 @@
+// =============================================================================
+// HAM10000 Melanoma Binary Classifier — Feature Extraction + SVM Pipeline
+//
+// Dataset layout (paths relative to the repo root, assumed CWD):
+//   skin-cancer-mnist-ham10000/HAM10000_metadata.csv         — image_id + dx
+//   skin-cancer-mnist-ham10000/HAM10000_images_part_1/       — ISIC_*.jpg
+//   skin-cancer-mnist-ham10000/HAM10000_images_part_2/       — ISIC_*.jpg
+//   ham10000-lesion-segmentations/
+//     HAM10000_segmentations_lesion_tschandl/                — ISIC_*_segmentation.png
+//   feature_extractor.onnx                                   — ResNet50, 2048-d output
+//
+// Model input:  (1, 3, 224, 224) float32, ImageNet-normalised, BGR→RGB swap
+// Model output: (1, 2048)        float32, L2-normalised feature vector
+//
+// SVM hyper-parameters:
+//   trainAuto() performs 5-fold cross-validated grid search over C and γ.
+//   For ResNet50 2048-d L2 features on skin-lesion data the literature
+//   suggests C ≈ 10 and γ ≈ 1/dim ≈ 5e-4 as warm-start values; trainAuto()
+//   explores a log-scale grid bracketing these ranges automatically.
+// =============================================================================
+
+#include <opencv2/opencv.hpp>
+#include <opencv2/dnn.hpp>
+#include <opencv2/ml.hpp>
+#include <algorithm>
+#include <fstream>
+#include <iostream>
+#include <random>
+#include <sstream>
+#include <string>
+#include <vector>
+
+using namespace cv;
+using namespace cv::dnn;
+using namespace cv::ml;
+using namespace std;
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+static const int    N_SAMPLES_PER_CLASS = 200;  // balanced subset per class
+static const int    PCA_COMPONENTS      = 128;  // dimensionality after PCA
+static const int    CV_FOLDS            = 5;    // cross-validation folds for trainAuto
+static const string MODEL_PATH    = "../feature_extractor.onnx";
+static const string METADATA_CSV  = "../skin-cancer-mnist-ham10000/HAM10000_metadata.csv";
+static const string IMG_DIR_1     = "../skin-cancer-mnist-ham10000/HAM10000_images_part_1/";
+static const string IMG_DIR_2     = "../skin-cancer-mnist-ham10000/HAM10000_images_part_2/";
+static const string MASK_DIR      = "../ham10000-lesion-segmentations/"
+                                    "HAM10000_segmentations_lesion_tschandl/";
+
+// ImageNet channel statistics (RGB order)
+static const float IMAGENET_MEAN[3] = {0.485f, 0.456f, 0.406f}; // R, G, B
+static const float IMAGENET_STD[3]  = {0.229f, 0.224f, 0.225f}; // R, G, B
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Parse metadata CSV and return two lists of ISIC image IDs:
+//   melanoma_ids  — dx == "mel"  (label 1)
+//   other_ids     — all other dx (label 0)
+void loadMetadata(vector<string>& melanoma_ids, vector<string>& other_ids)
+{
+    ifstream file(METADATA_CSV);
+    if (!file.is_open())
+    {
+        cerr << "ERROR: Cannot open " << METADATA_CSV << endl;
+        exit(1);
+    }
+
+    string line, token;
+    getline(file, line); // skip header
+
+    // Find column indices
+    istringstream hdr(line);
+    int col = 0, image_id_col = -1, dx_col = -1;
+    while (getline(hdr, token, ','))
+    {
+        // Trim CR/LF
+        token.erase(remove(token.begin(), token.end(), '\r'), token.end());
+        if (token == "image_id") image_id_col = col;
+        if (token == "dx")       dx_col       = col;
+        ++col;
+    }
+    if (image_id_col < 0 || dx_col < 0)
+    {
+        cerr << "ERROR: Could not find image_id or dx column in metadata." << endl;
+        exit(1);
+    }
+
+    while (getline(file, line))
+    {
+        istringstream ss(line);
+        string image_id, dx;
+        int c = 0;
+        while (getline(ss, token, ','))
+        {
+            token.erase(remove(token.begin(), token.end(), '\r'), token.end());
+            if (c == image_id_col) image_id = token;
+            if (c == dx_col)       dx        = token;
+            ++c;
+        }
+        if (dx == "mel")
+            melanoma_ids.push_back(image_id);
+        else
+            other_ids.push_back(image_id);
+    }
+    cout << "Metadata loaded: " << melanoma_ids.size() << " melanoma, "
+         << other_ids.size() << " other." << endl;
+}
+
+// Locate an image file across both part directories.
+string findImagePath(const string& image_id)
+{
+    string p1 = IMG_DIR_1 + image_id + ".jpg";
+    string p2 = IMG_DIR_2 + image_id + ".jpg";
+    if (!imread(p1, IMREAD_UNCHANGED).empty()) return p1;
+    return p2;
+}
+
+// Preprocess one image and run it through the ONNX feature extractor.
+// Returns a 1×2048 float32 Mat, or an empty Mat on failure.
+Mat extractFeatures(Net& net, const string& image_id)
+{
+    string img_path  = findImagePath(image_id);
+    string mask_path = MASK_DIR + image_id + "_segmentation.png";
+
+    Mat img  = imread(img_path,  IMREAD_COLOR);
+    Mat mask = imread(mask_path, IMREAD_GRAYSCALE);
+
+    if (img.empty())
+    {
+        cerr << "  WARN: Cannot load image: " << img_path << endl;
+        return Mat();
+    }
+    if (mask.empty())
+    {
+        cerr << "  WARN: Cannot load mask: " << mask_path << endl;
+        return Mat();
+    }
+
+    // 1. Apply lesion segmentation mask (background → black)
+    Mat maskedImg;
+    img.copyTo(maskedImg, mask);
+
+    // 2. Resize to network input resolution
+    resize(maskedImg, maskedImg, Size(224, 224), 0, 0, INTER_LINEAR);
+
+    // 3. Median filter (3×3) — removes sensor noise before feature extraction
+    medianBlur(maskedImg, maskedImg, 3);
+
+    // 4. Convert to float32 in [0, 1]
+    maskedImg.convertTo(maskedImg, CV_32FC3, 1.0 / 255.0);
+
+    // 5. Per-channel ImageNet normalisation: (x − mean) / std
+    //    OpenCV stores channels as BGR; ImageNet stats are in RGB order,
+    //    so the index mapping is: B=ch0→idx2, G=ch1→idx1, R=ch2→idx0.
+    vector<Mat> bgr(3);
+    split(maskedImg, bgr);
+    bgr[0] = (bgr[0] - IMAGENET_MEAN[2]) / IMAGENET_STD[2]; // B
+    bgr[1] = (bgr[1] - IMAGENET_MEAN[1]) / IMAGENET_STD[1]; // G
+    bgr[2] = (bgr[2] - IMAGENET_MEAN[0]) / IMAGENET_STD[0]; // R
+    merge(bgr, maskedImg);
+
+    // 6. Build blob: swapRB=true converts BGR→RGB to match model expectations
+    Mat blob = blobFromImage(maskedImg, 1.0, Size(224, 224),
+                             Scalar(), /*swapRB=*/true, /*crop=*/false);
+
+    // 7. Forward pass → 2048-d L2-normalised feature vector
+    net.setInput(blob, "image");
+    Mat features = net.forward("features"); // shape: (1, 2048)
+    return features.reshape(1, 1);          // ensure row vector: 1×2048
+}
+
+// Zero-mean / unit-variance scaling (StandardScaler).
+// Computes stats from `data` in-place and returns the mean/stddev rows
+// so the same transform can be applied to new samples at inference time.
+void standardScale(Mat& data, Mat& featureMean, Mat& featureStd)
+{
+    // Compute column-wise mean and std
+    reduce(data, featureMean, 0, REDUCE_AVG);    // 1 × D
+
+    Mat sq;
+    multiply(data, data, sq);
+    Mat sqMean;
+    reduce(sq, sqMean, 0, REDUCE_AVG);           // E[x²]
+
+    Mat meanSq;
+    multiply(featureMean, featureMean, meanSq);  // (E[x])²
+
+    sqrt(sqMean - meanSq, featureStd);           // std = sqrt(E[x²] − E[x]²)
+    featureStd.setTo(1.0f,
+        featureStd < 1e-8f);  // avoid division by zero for constant features
+
+    for (int r = 0; r < data.rows; ++r)
+    {
+        data.row(r) = (data.row(r) - featureMean) / featureStd;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main pipeline
+// ---------------------------------------------------------------------------
+int main()
+{
+    // ------------------------------------------------------------------
+    // 1. Load ONNX feature extractor
+    // ------------------------------------------------------------------
+    cout << "Loading ONNX model from: " << MODEL_PATH << endl;
+    Net net = readNetFromONNX(MODEL_PATH);
+    net.setPreferableBackend(DNN_BACKEND_OPENCV);
+    net.setPreferableTarget(DNN_TARGET_CPU);
+
+    // ------------------------------------------------------------------
+    // 2. Parse metadata and sample a balanced subset
+    // ------------------------------------------------------------------
+    vector<string> melanoma_ids, other_ids;
+    loadMetadata(melanoma_ids, other_ids);
+
+    mt19937 rng(42);
+    shuffle(melanoma_ids.begin(), melanoma_ids.end(), rng);
+    shuffle(other_ids.begin(),    other_ids.end(),    rng);
+
+    int n_mel   = min((int)melanoma_ids.size(), N_SAMPLES_PER_CLASS);
+    int n_other = min((int)other_ids.size(),    N_SAMPLES_PER_CLASS);
+    melanoma_ids.resize(n_mel);
+    other_ids.resize(n_other);
+
+    cout << "Sampling " << n_mel << " melanoma and "
+         << n_other << " non-melanoma images." << endl;
+
+    // Build combined list with binary labels  (1 = melanoma, 0 = other)
+    vector<string> all_ids;
+    vector<int>    all_labels;
+    for (auto& id : melanoma_ids) { all_ids.push_back(id); all_labels.push_back(1); }
+    for (auto& id : other_ids)    { all_ids.push_back(id); all_labels.push_back(0); }
+
+    // ------------------------------------------------------------------
+    // 3. Feature extraction loop
+    // ------------------------------------------------------------------
+    Mat allFeatures;
+    vector<int> usedLabels;
+
+    cout << "Extracting features (" << all_ids.size() << " images)..." << endl;
+    for (size_t i = 0; i < all_ids.size(); ++i)
+    {
+        if (i % 50 == 0)
+            cout << "  [" << i << "/" << all_ids.size() << "] " << all_ids[i] << endl;
+
+        Mat feat = extractFeatures(net, all_ids[i]);
+        if (feat.empty()) continue;  // skip failed loads
+
+        allFeatures.push_back(feat);
+        usedLabels.push_back(all_labels[i]);
+    }
+    cout << "Feature matrix: " << allFeatures.rows << " × "
+         << allFeatures.cols << endl;
+
+    // ------------------------------------------------------------------
+    // 4. StandardScaler — zero-mean / unit-variance per feature
+    //    (critical for RBF SVM: all dimensions must be on the same scale)
+    // ------------------------------------------------------------------
+    cout << "Applying StandardScaler..." << endl;
+    Mat featureMean, featureStd;
+    standardScale(allFeatures, featureMean, featureStd);
+
+    // ------------------------------------------------------------------
+    // 5. PCA dimensionality reduction: 2048-d → PCA_COMPONENTS-d
+    //    Reduces noise and speeds up SVM training significantly.
+    // ------------------------------------------------------------------
+    cout << "Running PCA (" << allFeatures.cols << " → "
+         << PCA_COMPONENTS << " dims)..." << endl;
+    PCA pca(allFeatures, Mat(), PCA::DATA_AS_ROW, PCA_COMPONENTS);
+    Mat reducedFeatures = pca.project(allFeatures);
+
+    // ------------------------------------------------------------------
+    // 6. Prepare labels
+    // ------------------------------------------------------------------
+    Mat labelsMat(usedLabels, /*copyData=*/true);
+    labelsMat.convertTo(labelsMat, CV_32S);
+
+    // ------------------------------------------------------------------
+    // 7. SVM (C-SVC, RBF kernel) with automated hyper-parameter search
+    //
+    //    trainAuto() runs CV_FOLDS-fold cross-validation over log-scale
+    //    grids for C and γ.  For 2048-d ResNet50 features the sweet-spot
+    //    typically falls around C ≈ 10, γ ≈ 1/dim ≈ 5e-4.  trainAuto()
+    //    covers this range with its default ParamGrid:
+    //      C grid  : [0.1 .. 500]   (log-scale)
+    //      γ grid  : [1e-5 .. 0.6]  (log-scale)
+    //    Adjust CV_FOLDS or supply custom ParamGrid objects if you want a
+    //    finer or coarser search.
+    // ------------------------------------------------------------------
+    cout << "Training SVM with RBF kernel (trainAuto, "
+         << CV_FOLDS << "-fold CV)..." << endl;
+
+    Ptr<SVM> svm = SVM::create();
+    svm->setType(SVM::C_SVC);
+    svm->setKernel(SVM::RBF);
+    svm->setTermCriteria(TermCriteria(TermCriteria::MAX_ITER | TermCriteria::EPS,
+                                     10000, 1e-6));
+
+    Ptr<TrainData> trainData = TrainData::create(reducedFeatures,
+                                                  ROW_SAMPLE, labelsMat);
+    // trainAuto performs grid-search over C and Gamma via k-fold CV
+    svm->trainAuto(trainData, CV_FOLDS,
+                   SVM::getDefaultGrid(SVM::C),
+                   SVM::getDefaultGrid(SVM::GAMMA),
+                   SVM::getDefaultGrid(SVM::P),
+                   SVM::getDefaultGrid(SVM::NU),
+                   SVM::getDefaultGrid(SVM::COEF),
+                   SVM::getDefaultGrid(SVM::DEGREE));
+
+    cout << "Best C: "     << svm->getC()
+         << "  Best γ: "   << svm->getGamma() << endl;
+
+    // ------------------------------------------------------------------
+    // 8. Save all artefacts needed for inference
+    // ------------------------------------------------------------------
+    svm->save("isic_svm_model.xml");
+    pca.write(FileStorage("isic_pca.xml", FileStorage::WRITE), "pca");
+    FileStorage scaler("isic_scaler.xml", FileStorage::WRITE);
+    scaler << "mean" << featureMean << "std" << featureStd;
+    scaler.release();
+
+    cout << "Done.  Artefacts saved:\n"
+         << "  isic_svm_model.xml  — trained SVM\n"
+         << "  isic_pca.xml        — PCA projection\n"
+         << "  isic_scaler.xml     — StandardScaler mean/std\n";
+
+    return 0;
+}
