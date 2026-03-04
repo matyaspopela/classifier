@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <numeric>
 #include <random>
 #include <sstream>
 #include <string>
@@ -39,6 +40,7 @@ using namespace std;
 // Configuration
 // ---------------------------------------------------------------------------
 static const int    N_SAMPLES_PER_CLASS = 200;  // balanced subset per class
+static const float  TEST_RATIO          = 0.2f; // 80/20 train/test split
 static const int    PCA_COMPONENTS      = 128;  // dimensionality after PCA
 static const int    CV_FOLDS            = 5;    // cross-validation folds for trainAuto
 static const string MODEL_PATH    = "../feature_extractor.onnx";
@@ -114,7 +116,9 @@ string findImagePath(const string& image_id)
 {
     string p1 = IMG_DIR_1 + image_id + ".jpg";
     string p2 = IMG_DIR_2 + image_id + ".jpg";
-    if (!imread(p1, IMREAD_UNCHANGED).empty()) return p1;
+    // Use filesystem check instead of imread (fast, no codec needed)
+    ifstream f1(p1);
+    if (f1.good()) return p1;
     return p2;
 }
 
@@ -178,12 +182,12 @@ Mat extractFeatures(Net& net, const string& image_id)
 void standardScale(Mat& data, Mat& featureMean, Mat& featureStd)
 {
     // Compute column-wise mean and std
-    reduce(data, featureMean, 0, REDUCE_AVG);    // 1 × D
+    cv::reduce(data, featureMean, 0, REDUCE_AVG);    // 1 × D
 
     Mat sq;
     multiply(data, data, sq);
     Mat sqMean;
-    reduce(sq, sqMean, 0, REDUCE_AVG);           // E[x²]
+    cv::reduce(sq, sqMean, 0, REDUCE_AVG);           // E[x²]
 
     Mat meanSq;
     multiply(featureMean, featureMean, meanSq);  // (E[x])²
@@ -192,6 +196,15 @@ void standardScale(Mat& data, Mat& featureMean, Mat& featureStd)
     featureStd.setTo(1.0f,
         featureStd < 1e-8f);  // avoid division by zero for constant features
 
+    for (int r = 0; r < data.rows; ++r)
+    {
+        data.row(r) = (data.row(r) - featureMean) / featureStd;
+    }
+}
+
+// Apply a previously computed StandardScaler transform to new data.
+void applyScale(Mat& data, const Mat& featureMean, const Mat& featureStd)
+{
     for (int r = 0; r < data.rows; ++r)
     {
         data.row(r) = (data.row(r) - featureMean) / featureStd;
@@ -257,30 +270,62 @@ int main()
          << allFeatures.cols << endl;
 
     // ------------------------------------------------------------------
-    // 4. StandardScaler — zero-mean / unit-variance per feature
+    // 4. Train / Test split (stratified-ish: same shuffle seed)
+    // ------------------------------------------------------------------
+    int nTotal = allFeatures.rows;
+    int nTest  = max(1, (int)(nTotal * TEST_RATIO));
+    int nTrain = nTotal - nTest;
+
+    // Shuffle indices so train/test is random
+    vector<int> indices(nTotal);
+    iota(indices.begin(), indices.end(), 0);
+    shuffle(indices.begin(), indices.end(), rng);
+
+    Mat trainFeatures, testFeatures;
+    vector<int> trainLabels, testLabels;
+    for (int i = 0; i < nTotal; ++i)
+    {
+        int idx = indices[i];
+        if (i < nTrain) {
+            trainFeatures.push_back(allFeatures.row(idx));
+            trainLabels.push_back(usedLabels[idx]);
+        } else {
+            testFeatures.push_back(allFeatures.row(idx));
+            testLabels.push_back(usedLabels[idx]);
+        }
+    }
+    cout << "Split: " << nTrain << " train, " << nTest << " test." << endl;
+
+    // ------------------------------------------------------------------
+    // 5. StandardScaler — fit on TRAIN, apply to both
     //    (critical for RBF SVM: all dimensions must be on the same scale)
     // ------------------------------------------------------------------
-    cout << "Applying StandardScaler..." << endl;
+    cout << "Applying StandardScaler (fit on train)..." << endl;
     Mat featureMean, featureStd;
-    standardScale(allFeatures, featureMean, featureStd);
+    standardScale(trainFeatures, featureMean, featureStd);
+    applyScale(testFeatures, featureMean, featureStd);
 
     // ------------------------------------------------------------------
-    // 5. PCA dimensionality reduction: 2048-d → PCA_COMPONENTS-d
-    //    Reduces noise and speeds up SVM training significantly.
+    // 6. PCA dimensionality reduction: 2048-d → PCA_COMPONENTS-d
+    //    Fit on train, project both sets.
     // ------------------------------------------------------------------
-    cout << "Running PCA (" << allFeatures.cols << " → "
+    cout << "Running PCA (" << trainFeatures.cols << " → "
          << PCA_COMPONENTS << " dims)..." << endl;
-    PCA pca(allFeatures, Mat(), PCA::DATA_AS_ROW, PCA_COMPONENTS);
-    Mat reducedFeatures = pca.project(allFeatures);
+    PCA pca(trainFeatures, Mat(), PCA::DATA_AS_ROW, PCA_COMPONENTS);
+    Mat reducedTrain = pca.project(trainFeatures);
+    Mat reducedTest  = pca.project(testFeatures);
 
     // ------------------------------------------------------------------
-    // 6. Prepare labels
+    // 7. Prepare labels
     // ------------------------------------------------------------------
-    Mat labelsMat(usedLabels, /*copyData=*/true);
-    labelsMat.convertTo(labelsMat, CV_32S);
+    Mat trainLabelsMat(trainLabels, /*copyData=*/true);
+    trainLabelsMat.convertTo(trainLabelsMat, CV_32S);
+
+    Mat testLabelsMat(testLabels, /*copyData=*/true);
+    testLabelsMat.convertTo(testLabelsMat, CV_32S);
 
     // ------------------------------------------------------------------
-    // 7. SVM (C-SVC, RBF kernel) with automated hyper-parameter search
+    // 8. SVM (C-SVC, RBF kernel) with automated hyper-parameter search
     //
     //    trainAuto() runs CV_FOLDS-fold cross-validation over log-scale
     //    grids for C and γ.  For 2048-d ResNet50 features the sweet-spot
@@ -300,8 +345,8 @@ int main()
     svm->setTermCriteria(TermCriteria(TermCriteria::MAX_ITER | TermCriteria::EPS,
                                      10000, 1e-6));
 
-    Ptr<TrainData> trainData = TrainData::create(reducedFeatures,
-                                                  ROW_SAMPLE, labelsMat);
+    Ptr<TrainData> trainData = TrainData::create(reducedTrain,
+                                                  ROW_SAMPLE, trainLabelsMat);
     // trainAuto performs grid-search over C and Gamma via k-fold CV
     svm->trainAuto(trainData, CV_FOLDS,
                    SVM::getDefaultGrid(SVM::C),
@@ -312,13 +357,57 @@ int main()
                    SVM::getDefaultGrid(SVM::DEGREE));
 
     cout << "Best C: "     << svm->getC()
-         << "  Best γ: "   << svm->getGamma() << endl;
+         << "  Best \xCE\xB3: "   << svm->getGamma() << endl;
 
     // ------------------------------------------------------------------
-    // 8. Save all artefacts needed for inference
+    // 9. Evaluate on the held-out test set
+    // ------------------------------------------------------------------
+    cout << endl << "=== Evaluation on test set (" << nTest << " samples) ===" << endl;
+
+    Mat predictions;
+    svm->predict(reducedTest, predictions);
+
+    // Confusion matrix: rows = actual, cols = predicted
+    //   [TN  FP]
+    //   [FN  TP]
+    int TP = 0, TN = 0, FP = 0, FN = 0;
+    for (int i = 0; i < nTest; ++i)
+    {
+        int actual = testLabels[i];
+        int pred   = (int)predictions.at<float>(i, 0);
+        if      (actual == 1 && pred == 1) ++TP;
+        else if (actual == 0 && pred == 0) ++TN;
+        else if (actual == 0 && pred == 1) ++FP;
+        else                               ++FN;
+    }
+
+    float accuracy  = (float)(TP + TN) / nTest;
+    float precision = TP + FP > 0 ? (float)TP / (TP + FP) : 0.0f;
+    float recall    = TP + FN > 0 ? (float)TP / (TP + FN) : 0.0f;
+    float f1        = precision + recall > 0
+                      ? 2.0f * precision * recall / (precision + recall) : 0.0f;
+
+    cout << endl;
+    cout << "Confusion Matrix:" << endl;
+    cout << "                 Predicted 0   Predicted 1" << endl;
+    cout << "  Actual 0 (other)    " << TN << "             " << FP << endl;
+    cout << "  Actual 1 (mel)      " << FN << "             " << TP << endl;
+    cout << endl;
+    cout << "Accuracy  : " << (accuracy  * 100) << "%" << endl;
+    cout << "Precision : " << (precision * 100) << "%  (of predicted melanoma, how many are correct)" << endl;
+    cout << "Recall    : " << (recall    * 100) << "%  (of actual melanoma, how many were found)" << endl;
+    cout << "F1 Score  : " << (f1        * 100) << "%" << endl;
+    cout << endl;
+
+    // ------------------------------------------------------------------
+    // 10. Save all artefacts needed for inference
     // ------------------------------------------------------------------
     svm->save("isic_svm_model.xml");
-    pca.write(FileStorage("isic_pca.xml", FileStorage::WRITE), "pca");
+    {
+        FileStorage pcaFs("isic_pca.xml", FileStorage::WRITE);
+        pca.write(pcaFs);   // writes mean, eigenvalues, eigenvectors
+        // Load back at inference with: pca.read(pcaFs.root())
+    }
     FileStorage scaler("isic_scaler.xml", FileStorage::WRITE);
     scaler << "mean" << featureMean << "std" << featureStd;
     scaler.release();
