@@ -36,13 +36,11 @@ using namespace cv::dnn;
 using namespace cv::ml;
 using namespace std;
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-static const int    N_SAMPLES_PER_CLASS = 200;  // balanced subset per class
-static const float  TEST_RATIO          = 0.2f; // 80/20 train/test split
-static const int    PCA_COMPONENTS      = 128;  // dimensionality after PCA
-static const int    CV_FOLDS            = 5;    // cross-validation folds for trainAuto
+//config
+static const int    N_SAMPLES_PER_CLASS = 500;  // balanced subset per class
+static const float  TEST_RATIO          = 0.2f; 
+static const int    PCA_COMPONENTS      = 80;  //after pca
+static const int    CV_FOLDS            = 10;    
 static const string MODEL_PATH    = "../feature_extractor.onnx";
 static const string METADATA_CSV  = "../skin-cancer-mnist-ham10000/HAM10000_metadata.csv";
 static const string IMG_DIR_1     = "../skin-cancer-mnist-ham10000/HAM10000_images_part_1/";
