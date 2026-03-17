@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """
-Kaggle training script — EfficientNetV2-S binary melanoma classifier.
+Kaggle training script — EfficientNetV2-S feature extractor for melanoma SVM pipeline.
+
+Strategy
+--------
+EfficientNetV2-S is fine-tuned end-to-end with a temporary MLP head and focal
+loss.  Only the trained backbone is exported as ONNX — the MLP head is
+discarded.  The C++ pipeline (src/pipeline.cpp) continues unchanged:
+  ONNX backbone → 1280-d features → StandardScaler → PCA(128) → RBF-SVM
+
+The only required change in C++ is pointing MODEL_PATH at the new .onnx file
+and updating FEATURE_DIM from 2048 to 1280 (PCA_COMPONENTS = 128 is unchanged).
 
 Datasets to add in the Kaggle notebook sidebar:
   - kmader/skin-cancer-mnist-ham10000
@@ -12,15 +22,9 @@ Install before running (add a code cell at the top of your notebook):
 
 Hardware: Kaggle T4 x2  (~25–35 min total)
 
-Output: /kaggle/working/melanoma_classifier.onnx
-  Input  node "image" : (batch, 3, 224, 224) float32, ImageNet-normalised
-  Output node "logit" : (batch, 1)           float32, raw logit
-                        → apply sigmoid in C++ to get [0, 1] probability
-
-NOTE: the C++ pipeline (src/pipeline.cpp) will need updating to:
-  1. Load melanoma_classifier.onnx instead of feature_extractor.onnx
-  2. Forward-pass the image and read the single output float (the logit)
-  3. Apply sigmoid and threshold at 0.5 — no PCA, scaler, or SVM needed
+Output: /kaggle/working/feature_extractor.onnx
+  Input  node "image"    : (batch, 3, 224, 224) float32, ImageNet-normalised
+  Output node "features" : (batch, 1280)        float32, L2-normalised feature vector
 """
 
 import os
@@ -54,7 +58,7 @@ IMG_DIRS = [
 ]
 # Set to None if you did not upload the segmentation dataset
 MASK_DIR     = "/kaggle/input/ham10000-lesion-segmentations/HAM10000_segmentations_lesion_tschandl/"
-OUTPUT_ONNX  = "/kaggle/working/melanoma_classifier.onnx"
+OUTPUT_ONNX  = "/kaggle/working/feature_extractor.onnx"
 CHECKPOINT   = "/kaggle/working/best_checkpoint.pt"
 
 # ---------------------------------------------------------------------------
@@ -162,7 +166,13 @@ val_tf = A.Compose([
 # Model
 # ---------------------------------------------------------------------------
 class MelanomaClassifier(nn.Module):
-    """EfficientNetV2-S backbone + small MLP head for binary melanoma classification."""
+    """
+    EfficientNetV2-S backbone + small MLP head.
+
+    The head is only used during training to drive end-to-end gradient flow
+    so the backbone learns dermoscopy-specific features.  At export time only
+    the backbone is serialised; the head is discarded.
+    """
 
     def __init__(self):
         super().__init__()
@@ -178,11 +188,17 @@ class MelanomaClassifier(nn.Module):
             nn.Linear(feat_dim, 256),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(256, 1),   # single logit for BCEWithLogitsLoss
+            nn.Linear(256, 1),   # single logit — used only during training
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Full forward pass (training): backbone → head → logit."""
         return self.head(self.backbone(x))  # (batch, 1)
+
+    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Backbone only (export / inference): returns L2-normalised 1280-d vector."""
+        features = self.backbone(x)                    # (batch, 1280)
+        return F.normalize(features, p=2, dim=1)       # unit-sphere, matches C++ pipeline
 
 
 # ---------------------------------------------------------------------------
@@ -299,24 +315,44 @@ def main():
     print(f"\nBest val AUC: {best_auc:.4f}")
 
     # ── Export ONNX (OpenCV-compatible: legacy exporter, opset 13) ───────────
-    # Re-instantiate a clean (non-DataParallel) model and load best weights.
+    # Load best weights into a clean (non-DataParallel) model, then wrap just
+    # the backbone in a thin nn.Module so the export graph contains only the
+    # feature-extraction path.  The MLP head is intentionally excluded — the
+    # C++ pipeline handles classification via its own PCA + RBF-SVM.
     core = MelanomaClassifier()
     core.load_state_dict(best_state)
     core.eval()
 
+    class BackboneOnly(nn.Module):
+        """Thin wrapper: backbone → L2-normalised 1280-d feature vector."""
+        def __init__(self, classifier: MelanomaClassifier):
+            super().__init__()
+            self.backbone = classifier.backbone
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return F.normalize(self.backbone(x), p=2, dim=1)
+
+    backbone_export = BackboneOnly(core)
+    backbone_export.eval()
+
     dummy = torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+
+    # Sanity-check output shape before writing the file
+    with torch.no_grad():
+        test_out = backbone_export(dummy)
+    assert test_out.shape == (1, 1280), f"Unexpected output shape: {test_out.shape}"
 
     print(f"\nExporting ONNX → {OUTPUT_ONNX}")
     torch.onnx.export(
-        core,
+        backbone_export,
         dummy,
         OUTPUT_ONNX,
         export_params       = True,
         opset_version       = 13,   # highest opset fully supported by OpenCV 4.x DNN
         do_constant_folding = True,
         input_names         = ["image"],
-        output_names        = ["logit"],
-        dynamic_axes        = {"image": {0: "batch_size"}, "logit": {0: "batch_size"}},
+        output_names        = ["features"],
+        dynamic_axes        = {"image": {0: "batch_size"}, "features": {0: "batch_size"}},
         dynamo              = False, # CRITICAL: legacy exporter required for OpenCV
     )
 
@@ -336,7 +372,12 @@ def main():
 
     size_mb = Path(OUTPUT_ONNX).stat().st_size / 1024 ** 2
     print(f"Done → {OUTPUT_ONNX}  ({size_mb:.1f} MB)")
-    print("Output 'logit' is a raw float — apply sigmoid in C++ to get probability in [0, 1].")
+    print(
+        "Output node 'features': (batch, 1280) L2-normalised float32.\n"
+        "Drop this file into your C++ pipeline in place of the old feature_extractor.onnx.\n"
+        "Only change needed in pipeline.cpp: update the FEATURE_DIM comment (2048 → 1280);\n"
+        "PCA, StandardScaler, and SVM code are untouched."
+    )
 
 
 if __name__ == "__main__":
