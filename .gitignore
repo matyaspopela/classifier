@@ -4,3 +4,4 @@ skin-cancer-mnist-ham10000.zip
 skin-cancer-mnist-ham10000/*
 ham10000-lesion-segmentations/*
 build/
+dataset/

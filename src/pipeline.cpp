@@ -56,9 +56,7 @@ static const float IMAGENET_STD[3]  = {0.229f, 0.224f, 0.225f}; // R, G, B
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Parse metadata CSV and return two lists of ISIC image IDs:
-//   melanoma_ids  — dx == "mel"  (label 1)
-//   other_ids     — all other dx (label 0)
+
 void loadMetadata(vector<string>& melanoma_ids, vector<string>& other_ids)
 {
     ifstream file(METADATA_CSV);
