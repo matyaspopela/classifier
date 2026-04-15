@@ -82,6 +82,7 @@ void loadMetadata(vector<string>& melanoma_ids, vector<string>& other_ids)
         exit(1);
     }
 
+
     while (getline(file, line))
     {
         istringstream ss(line);
