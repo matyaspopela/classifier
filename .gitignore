@@ -5,3 +5,4 @@ skin-cancer-mnist-ham10000/*
 ham10000-lesion-segmentations/*
 build/
 dataset/
+.idea/*

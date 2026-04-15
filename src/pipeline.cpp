@@ -1,21 +1,19 @@
 // =============================================================================
-// HAM10000 Melanoma Binary Classifier — Feature Extraction + SVM Pipeline
+// Melanoma Binary Classifier — Feature Extraction + SVM Pipeline
 //
 // Dataset layout (paths relative to the repo root, assumed CWD):
-//   skin-cancer-mnist-ham10000/HAM10000_metadata.csv         — image_id + dx
-//   skin-cancer-mnist-ham10000/HAM10000_images_part_1/       — ISIC_*.jpg
-//   skin-cancer-mnist-ham10000/HAM10000_images_part_2/       — ISIC_*.jpg
-//   ham10000-lesion-segmentations/
-//     HAM10000_segmentations_lesion_tschandl/                — ISIC_*_segmentation.png
-//   feature_extractor.onnx                                   — ResNet50, 2048-d output
+//   dataset/skin-cancer-lesions-segmentation/data/metadata.csv  — image + MEL column
+//   dataset/skin-cancer-lesions-segmentation/data/images/       — ISIC_*.jpg
+//   dataset/skin-cancer-lesions-segmentation/data/masks/        — ISIC_*.png
+//   feature_extractor.onnx   — EfficientNetV2-S backbone, 1280-d L2-normed output
 //
 // Model input:  (1, 3, 224, 224) float32, ImageNet-normalised, BGR→RGB swap
-// Model output: (1, 2048)        float32, L2-normalised feature vector
+// Model output: (1, 1280)        float32, L2-normalised feature vector
 //
 // SVM hyper-parameters:
 //   trainAuto() performs 5-fold cross-validated grid search over C and γ.
-//   For ResNet50 2048-d L2 features on skin-lesion data the literature
-//   suggests C ≈ 10 and γ ≈ 1/dim ≈ 5e-4 as warm-start values; trainAuto()
+//   For EfficientNetV2-S 1280-d L2 features after PCA(128) the literature
+//   suggests C ≈ 10 and γ ≈ 1/128 ≈ 0.008 as warm-start values; trainAuto()
 //   explores a log-scale grid bracketing these ranges automatically.
 // =============================================================================
 
@@ -37,16 +35,14 @@ using namespace cv::ml;
 using namespace std;
 
 //config
-static const int    N_SAMPLES_PER_CLASS = 500;  // balanced subset per class
-static const float  TEST_RATIO          = 0.2f; 
-static const int    PCA_COMPONENTS      = 80;  //after pca
-static const int    CV_FOLDS            = 10;    
+static const int    N_SAMPLES_PER_CLASS = 1500;  // use all ~1113 melanoma + equal other
+static const float  TEST_RATIO          = 0.2f;
+static const int    PCA_COMPONENTS      = 128; // after pca; 1280-d → 128-d
+static const int    CV_FOLDS            = 5;   // 5-fold cross-validation (standard)
 static const string MODEL_PATH    = "../feature_extractor.onnx";
-static const string METADATA_CSV  = "../skin-cancer-mnist-ham10000/HAM10000_metadata.csv";
-static const string IMG_DIR_1     = "../skin-cancer-mnist-ham10000/HAM10000_images_part_1/";
-static const string IMG_DIR_2     = "../skin-cancer-mnist-ham10000/HAM10000_images_part_2/";
-static const string MASK_DIR      = "../ham10000-lesion-segmentations/"
-                                    "HAM10000_segmentations_lesion_tschandl/";
+static const string METADATA_CSV  = "../dataset/skin-cancer-lesions-segmentation/data/metadata.csv";
+static const string IMG_DIR      = "../dataset/skin-cancer-lesions-segmentation/data/images/";
+static const string MASK_DIR     = "../dataset/skin-cancer-lesions-segmentation/data/masks/";
 
 // ImageNet channel statistics (RGB order)
 static const float IMAGENET_MEAN[3] = {0.485f, 0.456f, 0.406f}; // R, G, B
@@ -71,34 +67,34 @@ void loadMetadata(vector<string>& melanoma_ids, vector<string>& other_ids)
 
     // Find column indices
     istringstream hdr(line);
-    int col = 0, image_id_col = -1, dx_col = -1;
+    int col = 0, image_col = -1, mel_col = -1;
     while (getline(hdr, token, ','))
     {
         // Trim CR/LF
         token.erase(remove(token.begin(), token.end(), '\r'), token.end());
-        if (token == "image_id") image_id_col = col;
-        if (token == "dx")       dx_col       = col;
+        if (token == "image") image_col = col;
+        if (token == "MEL")   mel_col   = col;
         ++col;
     }
-    if (image_id_col < 0 || dx_col < 0)
+    if (image_col < 0 || mel_col < 0)
     {
-        cerr << "ERROR: Could not find image_id or dx column in metadata." << endl;
+        cerr << "ERROR: Could not find 'image' or 'MEL' column in metadata." << endl;
         exit(1);
     }
 
     while (getline(file, line))
     {
         istringstream ss(line);
-        string image_id, dx;
+        string image_id, mel_val;
         int c = 0;
         while (getline(ss, token, ','))
         {
             token.erase(remove(token.begin(), token.end(), '\r'), token.end());
-            if (c == image_id_col) image_id = token;
-            if (c == dx_col)       dx        = token;
+            if (c == image_col) image_id = token;
+            if (c == mel_col)   mel_val  = token;
             ++c;
         }
-        if (dx == "mel")
+        if (mel_val == "1.0" || mel_val == "1")
             melanoma_ids.push_back(image_id);
         else
             other_ids.push_back(image_id);
@@ -107,23 +103,28 @@ void loadMetadata(vector<string>& melanoma_ids, vector<string>& other_ids)
          << other_ids.size() << " other." << endl;
 }
 
-// Locate an image file across both part directories.
+// Locate an image file in the images directory.
+// Returns an empty string if the file is not found.
 string findImagePath(const string& image_id)
 {
-    string p1 = IMG_DIR_1 + image_id + ".jpg";
-    string p2 = IMG_DIR_2 + image_id + ".jpg";
-    // Use filesystem check instead of imread (fast, no codec needed)
-    ifstream f1(p1);
-    if (f1.good()) return p1;
-    return p2;
+    string p = IMG_DIR + image_id + ".jpg";
+    ifstream f(p);
+    if (f.good()) return p;
+    return "";
 }
 
 // Preprocess one image and run it through the ONNX feature extractor.
-// Returns a 1×2048 float32 Mat, or an empty Mat on failure.
+// Returns a 1×1280 float32 Mat, or an empty Mat on failure.
 Mat extractFeatures(Net& net, const string& image_id)
 {
     string img_path  = findImagePath(image_id);
-    string mask_path = MASK_DIR + image_id + "_segmentation.png";
+    string mask_path = MASK_DIR + image_id + ".png";
+
+    if (img_path.empty())
+    {
+        cerr << "  WARN: Image not found in either directory: " << image_id << endl;
+        return Mat();
+    }
 
     Mat img  = imread(img_path,  IMREAD_COLOR);
     Mat mask = imread(mask_path, IMREAD_GRAYSCALE);
@@ -166,10 +167,10 @@ Mat extractFeatures(Net& net, const string& image_id)
     Mat blob = blobFromImage(maskedImg, 1.0, Size(224, 224),
                              Scalar(), /*swapRB=*/true, /*crop=*/false);
 
-    // 7. Forward pass → 2048-d L2-normalised feature vector
+    // 7. Forward pass → 1280-d L2-normalised feature vector
     net.setInput(blob, "image");
-    Mat features = net.forward("features"); // shape: (1, 2048)
-    return features.reshape(1, 1);          // ensure row vector: 1×2048
+    Mat features = net.forward("features"); // shape: (1, 1280)
+    return features.reshape(1, 1);          // ensure row vector: 1×1280
 }
 
 // Zero-mean / unit-variance scaling (StandardScaler).
@@ -324,9 +325,9 @@ int main()
     // 8. SVM (C-SVC, RBF kernel) with automated hyper-parameter search
     //
     //    trainAuto() runs CV_FOLDS-fold cross-validation over log-scale
-    //    grids for C and γ.  For 2048-d ResNet50 features the sweet-spot
-    //    typically falls around C ≈ 10, γ ≈ 1/dim ≈ 5e-4.  trainAuto()
-    //    covers this range with its default ParamGrid:
+    //    grids for C and γ.  For PCA(128) features from EfficientNetV2-S
+    //    the sweet-spot typically falls around C ≈ 10, γ ≈ 1/128 ≈ 0.008.
+    //    trainAuto() covers this range with its default ParamGrid:
     //      C grid  : [0.1 .. 500]   (log-scale)
     //      γ grid  : [1e-5 .. 0.6]  (log-scale)
     //    Adjust CV_FOLDS or supply custom ParamGrid objects if you want a
