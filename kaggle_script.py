@@ -1,31 +1,4 @@
 #!/usr/bin/env python3
-"""
-Kaggle training script — EfficientNetV2-S feature extractor for melanoma SVM pipeline.
-
-Strategy
---------
-EfficientNetV2-S is fine-tuned end-to-end with a temporary MLP head and focal
-loss.  Only the trained backbone is exported as ONNX — the MLP head is
-discarded.  The C++ pipeline (src/pipeline.cpp) continues unchanged:
-  ONNX backbone → 1280-d features → StandardScaler → PCA(128) → RBF-SVM
-
-The only required change in C++ is pointing MODEL_PATH at the new .onnx file
-and updating FEATURE_DIM from 2048 to 1280 (PCA_COMPONENTS = 128 is unchanged).
-
-Datasets to add in the Kaggle notebook sidebar:
-  - kmader/skin-cancer-mnist-ham10000
-  - Upload ham10000-lesion-segmentations.zip from this repo as a dataset
-    (or set MASK_DIR = None to train without masks)
-
-Install before running (add a code cell at the top of your notebook):
-  !pip install -q timm albumentations onnx onnxsim
-
-Hardware: Kaggle T4 x2  (~25–35 min total)
-
-Output: /kaggle/working/feature_extractor.onnx
-  Input  node "image"    : (batch, 3, 224, 224) float32, ImageNet-normalised
-  Output node "features" : (batch, 1280)        float32, L2-normalised feature vector
-"""
 
 import os
 import random
